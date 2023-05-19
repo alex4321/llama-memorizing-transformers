@@ -1,0 +1,6 @@
+website:
+  sidebar:
+    contents:
+      - index.ipynb
+      - 00_context_choice.ipynb
+      - 01_memory_collection.ipynb

@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "llama-memorizing-transformers"
+  site-url: "https://alex4321.github.io/llama-memorizing-transformers"
+  description: "A combination of LLAMA + LoRA tuning with the \"memorizing transformers\" approach"
+  repo-branch: main
+  repo-url: "https://github.com/alex4321/llama-memorizing-transformers"
