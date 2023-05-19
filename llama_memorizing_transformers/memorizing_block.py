@@ -13,7 +13,10 @@ from .memory_collection import BaseMemoryCollection
 
 # %% ../nbs/02_memorizing_block.ipynb 2
 class MemorizingLlamaDecoderLayer(nn.Module):
-    def __init__(self, module: LlamaDecoderLayer, context_choice: BaseContextChoice, memory: BaseMemoryCollection) -> None:
+    def __init__(self,
+                 module: LlamaDecoderLayer,
+                 context_choice: BaseContextChoice,
+                 memory: BaseMemoryCollection) -> None:
         """
         Module wraps original LlamaDecoderLayer to add memorizing stuff
         :param module: original decoder layer
@@ -38,4 +41,9 @@ class MemorizingLlamaDecoderLayer(nn.Module):
         hidden_states_merged = self.context_choice(hidden_states, hidden_states_memory)
         self.memory.add(hidden_states)
 
-        return self.module(hidden_states_merged, attention_mask, position_ids, past_key_value, output_attentions, use_cache)
+        return self.module(hidden_states_merged,
+                           attention_mask,
+                           position_ids,
+                           past_key_value,
+                           output_attentions,
+                           use_cache)
