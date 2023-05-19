@@ -138,7 +138,7 @@ class CosineKnnMemoryCollection(BaseMemoryCollection):
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, "cosine-knn-memory.pkl"), "wb") as dst:
             pickle.dump(self, dst)
-    
+
     @staticmethod
     def load(directory: str) -> BaseMemoryCollection:
         with open(os.path.join(directory, "cosine-knn-memory.pkl"), "rb") as src:
