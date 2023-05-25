@@ -60,7 +60,7 @@ class BaseMemoryCollection:
         with torch.no_grad():
             global_position_ids = self._local2global_position_offset + local_position_ids
             assert global_position_ids[0] <= self._remembered_tokens
-            remember_mask = global_position_ids < self.remember_until_position
+            remember_mask = (global_position_ids < self.remember_until_position) & (global_position_ids >= self._remembered_tokens)
             remember_inputs = inputs.masked_select(remember_mask.unsqueeze(-1))\
                 .view((-1, inputs.shape[-1]))
         tokens_to_remember = remember_inputs.shape[0]
