@@ -28,6 +28,25 @@ class MemorizingLlamaDecoderLayer(nn.Module):
         self.context_choice = context_choice
         self.memory = memory
 
+    def _extract_from_memory(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            batch_size, seq_length, embeddings_dim = hidden_states.shape
+            hidden_states_memory = []
+            for i in range(batch_size):
+                hidden_states_memory.append(
+                    self.memory.get(hidden_states[i]).view((1, seq_length, embeddings_dim))
+                )
+            hidden_states_memory = torch.cat(hidden_states_memory)
+        return hidden_states_memory
+    
+    def _add_to_memory(self, hidden_states: torch.Tensor, position_ids: torch.LongTensor) -> None:
+        with torch.no_grad():
+            batch_size, _, _ = hidden_states.shape
+            for i in range(batch_size):
+                sample_hidden_states = hidden_states[i]
+                sample_memory_position_ids = position_ids[i]
+                self.memory.add(sample_hidden_states, sample_memory_position_ids)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -37,10 +56,9 @@ class MemorizingLlamaDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        hidden_states_memory = self.memory.get(hidden_states)
+        hidden_states_memory = self._extract_from_memory(hidden_states)
         hidden_states_merged = self.context_choice(hidden_states, hidden_states_memory)
-        self.memory.add(hidden_states)
-
+        self._add_to_memory(hidden_states, position_ids)
         return self.module(hidden_states_merged,
                            attention_mask,
                            position_ids,

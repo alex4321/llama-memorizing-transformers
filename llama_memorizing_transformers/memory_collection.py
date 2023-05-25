@@ -15,21 +15,63 @@ __all__ = ['BaseMemoryCollection', 'CosineKnnMemoryCollection']
 
 # %% ../nbs/01_memory_collection.ipynb 5
 class BaseMemoryCollection:
+    def __init__(self, remember_until_position: int = 0):
+        self.remember_until_position = remember_until_position
+        self._local2global_position_offset = 0
+        self._remembered_tokens = 0
+
     def reset(self) -> None:
         """
         Reset memory
         """
-        raise NotImplementedError()
+        self._local2global_position_offset = 0
+        self._remembered_tokens = 0
     
     def get(self, inputs: torch.FloatTensor) -> torch.FloatTensor:
         """
         Get relevant "memories".
+        :param inputs: (Individual) sequence embedding matrix (2d array)
         """
         raise NotImplementedError()
     
-    def add(self, inputs: torch.FloatTensor) -> torch.FloatTensor:
+    def _check_position_ids_sequential(self, local_position_ids: torch.LongTensor) -> None:
         """
-        Remember stuff
+        Check if local_position_ids is a sequential vector
+        :param local_position_ids: position ids
+        """
+        assert len(local_position_ids.shape) == 1
+        with torch.no_grad():
+            if local_position_ids.shape[0]:
+                assert local_position_ids[0] == 0
+            id_diff = local_position_ids[1:] - local_position_ids[:-1]
+            assert torch.all(id_diff == 1)
+    
+    def add(self, inputs: torch.FloatTensor, local_position_ids: torch.LongTensor) -> None:
+        """
+        Remember stuff.
+        But only the part which (global) id <= self.remember_until_position
+        
+        :param inputs: (Individual) sequence embedding matrix (2d array)
+        :param local_position_ids: (Individual) sequence token ids (inside the chunk processed by transformer)
+        """
+        self._check_position_ids_sequential(local_position_ids)
+        assert len(inputs.shape) == 2
+        assert inputs.shape[0] == local_position_ids.shape[0]
+        with torch.no_grad():
+            global_position_ids = self._local2global_position_offset + local_position_ids
+            assert global_position_ids[0] <= self._remembered_tokens
+            remember_mask = global_position_ids < self.remember_until_position
+            remember_inputs = inputs.masked_select(remember_mask.unsqueeze(-1))\
+                .view((-1, inputs.shape[-1]))
+        tokens_to_remember = remember_inputs.shape[0]
+        self._add_filtered(remember_inputs)
+        self._remembered_tokens += tokens_to_remember
+        self._local2global_position_offset += tokens_to_remember
+    
+    def _add_filtered(self, inputs: torch.FloatTensor) -> None:
+        """
+        Remember the inputs embeddings
+        :param inputs: (Individual) sequence embedding matrix (2d array)
         """
         raise NotImplementedError()
     
@@ -48,12 +90,20 @@ class BaseMemoryCollection:
 
 # %% ../nbs/01_memory_collection.ipynb 6
 class CosineKnnMemoryCollection(BaseMemoryCollection):
-    def __init__(self, max_temporary_buffer_size: int) -> None:
-        super().__init__()
+    def __init__(self, max_temporary_buffer_size: int, remember_until_position: int = 0) -> None:
+        super().__init__(remember_until_position)
         self.max_temporary_buffer_size = max_temporary_buffer_size
         self.knns = []
         self.temporary_buffer = []
         self.vectors = []
+        self._buffer_knn = None
+
+    def reset(self) -> None:
+        super().reset()
+        self.knns = []
+        self.temporary_buffer = []
+        self.vectors = []
+        self._buffer_knn = None
 
     def _embeddings_numpy(self, embeddings: Union[np.ndarray, List[np.ndarray]]) -> np.ndarray:
         if isinstance(embeddings, list):
@@ -76,51 +126,62 @@ class CosineKnnMemoryCollection(BaseMemoryCollection):
         
         return inputs_normed
 
-    def _bruteforce_knn(self, embeddings) -> NearestNeighbors:
+    def _bruteforce_knn(self, embeddings, n_jobs=1) -> NearestNeighbors:
         # Cosine similarity and L2 distance on normed vectors have 1.0 corellation
         # Minkowski metric with p=2 is same as L2
-        nn = NearestNeighbors(n_neighbors=1, algorithm="brute", metric="minkowski", p=2, n_jobs=-1)
+        nn = NearestNeighbors(n_neighbors=1, algorithm="brute", metric="minkowski", p=2, n_jobs=n_jobs)
         nn.fit(self._norm(self._embeddings_numpy(embeddings)))
         return nn
     
-    def _knn(self, embeddings) -> NearestNeighbors:
+    def _knn(self, embeddings, n_jobs=-1) -> NearestNeighbors:
         # Cosine similarity and L2 distance on normed vectors have 1.0 corellation
         # Minkowski metric with p=2 is same as L2
-        nn = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="minkowski", p=2, n_jobs=-1)
+        nn = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="minkowski", p=2, n_jobs=n_jobs)
         nn.fit(self._norm(self._embeddings_numpy(embeddings)))
         return nn
+    
+    def _get_buffer_knn(self) -> NearestNeighbors:
+        if self._buffer_knn is None:
+            self._buffer_knn = self._bruteforce_knn(self.temporary_buffer)
+        return self._buffer_knn
     
     def get(self, inputs: torch.FloatTensor) -> torch.FloatTensor:
-        vectors = inputs.detach().cpu().float().numpy()
+        with torch.no_grad():
+            vectors = inputs.detach().cpu().float().numpy()
         vectors_normed = self._norm(vectors)
         nn: NearestNeighbors
         knns = self.knns
         if self.temporary_buffer:
-            knns = knns + [self._bruteforce_knn(self.temporary_buffer)]
+            knns = knns + [self._get_buffer_knn()]
         if len(knns) == 0:
             return inputs
         vectors_found = np.zeros(
             (inputs.shape[0], len(knns), inputs.shape[1]),
             dtype=np.float32
         )
+        distances_found = np.zeros(
+            (inputs.shape[0], len(knns))
+        )
         for i, nn in enumerate(knns):
-            indices_local = nn.kneighbors(vectors_normed, return_distance=False)
+            distances, indices_local = nn.kneighbors(vectors_normed, return_distance=True)
             indices = indices_local + i * self.max_temporary_buffer_size
             indices = indices.ravel()
-            nn_vectors = [self.vectors[i] for i in indices]
-            vectors_found[:, i, :] = nn_vectors
-        vectors_chosen = np.zeros((inputs.shape[0], inputs.shape[1]))
-        for i in range(inputs.shape[0]):
-            nn: NearestNeighbors = self._bruteforce_knn(vectors_found[i])
-            index = nn.kneighbors(vectors_normed[[i]], return_distance=False)
-            index = index.ravel()[0]
-            vectors_chosen[i, :] = vectors_found[i, index, :]
-        vectors_chosen_torch = torch.tensor(vectors_chosen, dtype=inputs.dtype, device=inputs.device)
+            distances = distances.ravel()
+            vectors_found[:, i, :] = [self.vectors[j] for j in indices]
+            distances_found[:, i] = distances
+        row_indices = np.arange((inputs.shape[0]), dtype=np.int32)
+        nearest_token_indices = distances_found.argmin(axis=-1)
+        vectors_chosen = vectors_found[row_indices, nearest_token_indices, :]
+        with torch.no_grad():
+            vectors_chosen_torch = torch.tensor(vectors_chosen, dtype=inputs.dtype, device=inputs.device)
         return vectors_chosen_torch
     
-    def add(self, inputs: torch.FloatTensor) -> torch.FloatTensor:
-        vectors = inputs.detach().cpu().float().numpy()
+    def _add_filtered(self, inputs: torch.FloatTensor) -> None:
+        with torch.no_grad():
+            vectors = inputs.detach().cpu().float().numpy()
         vectors_list = list(vectors)
+        if len(vectors_list):
+            self._buffer_knn = None
         self.temporary_buffer += vectors_list
         self.vectors += vectors_list
         if len(self.temporary_buffer) >= self.max_temporary_buffer_size:
