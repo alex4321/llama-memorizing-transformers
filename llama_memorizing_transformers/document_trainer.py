@@ -13,10 +13,13 @@ from torch.optim.lr_scheduler import LambdaLR
 from peft import PeftModelForCausalLM
 from transformers.models.llama import LlamaForCausalLM, LlamaTokenizer, LlamaTokenizerFast
 from .memory_collection import BaseMemoryCollection
+from .context_choice import BaseContextChoice
+import gc
 
 # %% ../nbs/04_document_trainer.ipynb 2
 class MemorizingLlamaDocumentTrainer:
     def __init__(self, model: Union[LlamaForCausalLM, PeftModelForCausalLM],
+                 context_choice: BaseContextChoice,
                  tokenizer: Union[LlamaTokenizerFast, LlamaTokenizer],
                  memory: BaseMemoryCollection,
                  tokens_per_chunk: int,
@@ -34,6 +37,7 @@ class MemorizingLlamaDocumentTrainer:
         else:
             raise TypeError("Unknown model type")
         self.llama = model
+        self.context_choice = context_choice
         self.tokenizer = tokenizer
         self.memory = memory
         self.tokens_per_chunk = tokens_per_chunk
@@ -78,7 +82,8 @@ class MemorizingLlamaDocumentTrainer:
             return self.tokenizer.vocab_size + 1
         return self.tokenizer.vocab_size
 
-    def _get_losses(self, document_tokens: torch.LongTensor, prompt_tokens: torch.LongTensor, sample_weight: float) -> Iterable[torch.FloatTensor]:
+    def _get_losses(self, document_tokens: torch.LongTensor, prompt_tokens: torch.LongTensor, sample_weight: float) -> \
+        Iterable[Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]]:
         def _inner(block_prompt_tokens: torch.LongTensor, block_label_tokens: torch.LongTensor) -> torch.FloatTensor:
             block_prompt_tokens = block_prompt_tokens.to(self.llama.device)
             block_label_tokens = block_label_tokens.to(self.llama.device)
@@ -96,20 +101,24 @@ class MemorizingLlamaDocumentTrainer:
 
             logits_flatten = logits.view((-1, self._vocab_size))
             labels_flatten = block_label_tokens.view((-1,))
-            loss = cross_entropy(
-                input=logits_flatten,
-                target=labels_flatten,
-            )
+            lm_loss = cross_entropy(input=logits_flatten, target=labels_flatten) * sample_weight
+            context_choice_loss = self.context_choice.get_loss_component() * sample_weight
+            loss = lm_loss + context_choice_loss
+            return loss, context_choice_loss, lm_loss
 
-            return loss * sample_weight
-
+        loss = 0
+        loss_context = 0
+        loss_lm = 0
         for block_prompt_tokens, block_label_tokens in self._get_train_block_tokens(document_tokens, prompt_tokens):
+            del loss, loss_context, loss_lm
+            gc.collect()
+            torch.cuda.empty_cache()
             if self.float16:
                 with torch.cuda.amp.autocast():
-                    loss = _inner(block_prompt_tokens, block_label_tokens)
+                    loss, loss_context, loss_lm = _inner(block_prompt_tokens, block_label_tokens)
             else:
-                loss = _inner(block_prompt_tokens, block_label_tokens)
-            yield loss
+                loss, loss_context, loss_lm = _inner(block_prompt_tokens, block_label_tokens)
+            yield loss, loss_context, loss_lm
 
     def train_document(self, document_tokens: torch.LongTensor, prompt_tokens: torch.LongTensor, sample_weight: float, callback_kwargs: Dict[str, Any]):
         self.llama.train()
@@ -118,7 +127,8 @@ class MemorizingLlamaDocumentTrainer:
             scaler = torch.cuda.amp.grad_scaler.GradScaler()
         else:
             scaler = None
-        for batch, loss in enumerate(self._get_losses(document_tokens, prompt_tokens, sample_weight)):
+        for batch, losses in enumerate(self._get_losses(document_tokens, prompt_tokens, sample_weight)):
+            loss, loss_context, loss_lm = losses
             if self.float16:
                 scaler.scale(loss).backward()
             else:
@@ -133,15 +143,27 @@ class MemorizingLlamaDocumentTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.float16:
                     scaler.update()
-            batch_callback_kwargs = dict(callback_kwargs, document_batch=batch, loss=loss)
+            batch_callback_kwargs = dict(callback_kwargs, document_batch=batch,
+                                         loss=loss.item(),
+                                         loss_lm=loss_lm.item(),
+                                         loss_context=loss_context.item())
+            del loss, loss_context, loss_lm
+            gc.collect()
+            torch.cuda.empty_cache()
             if self.train_callback:
-                self.train_callback(**batch_callback_kwargs)            
+                self.train_callback(**batch_callback_kwargs)
 
     def eval_document(self, document_tokens: torch.LongTensor, prompt_tokens: torch.LongTensor, sample_weight: float, callback_kwargs: Dict[str, Any]):
         self.llama.eval()
         with torch.no_grad():
-            for batch, loss in enumerate(self._get_losses(document_tokens, prompt_tokens, sample_weight)):
+            for batch, losses in enumerate(self._get_losses(document_tokens, prompt_tokens, sample_weight)):
+                loss, loss_context, loss_lm = losses
                 loss = loss.item()
-                batch_callback_kwargs = dict(callback_kwargs, document_batch=batch, loss=loss)
+                loss_context = loss_context.item()
+                loss_lm = loss_lm.item()
+                batch_callback_kwargs = dict(callback_kwargs, document_batch=batch,
+                                             loss=loss,
+                                             loss_lm=loss_lm,
+                                             loss_context=loss_context)
                 if self.eval_callback:
                     self.eval_callback(**batch_callback_kwargs)

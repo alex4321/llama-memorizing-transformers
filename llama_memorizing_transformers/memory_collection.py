@@ -15,7 +15,8 @@ __all__ = ['BaseMemoryCollection', 'CosineKnnMemoryCollection']
 
 # %% ../nbs/01_memory_collection.ipynb 5
 class BaseMemoryCollection:
-    def __init__(self, remember_until_position: int = 0):
+    def __init__(self, top_k: int, remember_until_position: int = 0):
+        self.top_k = top_k
         self.remember_until_position = remember_until_position
         self._local2global_position_offset = 0
         self._remembered_tokens = 0
@@ -90,8 +91,8 @@ class BaseMemoryCollection:
 
 # %% ../nbs/01_memory_collection.ipynb 6
 class CosineKnnMemoryCollection(BaseMemoryCollection):
-    def __init__(self, max_temporary_buffer_size: int, remember_until_position: int = 0) -> None:
-        super().__init__(remember_until_position)
+    def __init__(self, top_k: int, max_temporary_buffer_size: int, remember_until_position: int = 0) -> None:
+        super().__init__(top_k, remember_until_position)
         self.max_temporary_buffer_size = max_temporary_buffer_size
         self.knns = []
         self.temporary_buffer = []
@@ -129,14 +130,14 @@ class CosineKnnMemoryCollection(BaseMemoryCollection):
     def _bruteforce_knn(self, embeddings, n_jobs=1) -> NearestNeighbors:
         # Cosine similarity and L2 distance on normed vectors have 1.0 corellation
         # Minkowski metric with p=2 is same as L2
-        nn = NearestNeighbors(n_neighbors=1, algorithm="brute", metric="minkowski", p=2, n_jobs=n_jobs)
+        nn = NearestNeighbors(n_neighbors=self.top_k, algorithm="brute", metric="minkowski", p=2, n_jobs=n_jobs)
         nn.fit(self._norm(self._embeddings_numpy(embeddings)))
         return nn
     
     def _knn(self, embeddings, n_jobs=-1) -> NearestNeighbors:
-        # Cosine similarity and L2 distance on normed vectors have 1.0 corellation
+        # Cosine similarity and L2 distance on normed vectors have 1.0 corellation (spearman)
         # Minkowski metric with p=2 is same as L2
-        nn = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="minkowski", p=2, n_jobs=n_jobs)
+        nn = NearestNeighbors(n_neighbors=self.top_k, algorithm="auto", metric="minkowski", p=2, n_jobs=n_jobs)
         nn.fit(self._norm(self._embeddings_numpy(embeddings)))
         return nn
     
@@ -156,22 +157,35 @@ class CosineKnnMemoryCollection(BaseMemoryCollection):
         if len(knns) == 0:
             return inputs
         vectors_found = np.zeros(
-            (inputs.shape[0], len(knns), inputs.shape[1]),
+            (inputs.shape[0], len(knns), self.top_k, inputs.shape[1]),
             dtype=np.float32
         )
         distances_found = np.zeros(
-            (inputs.shape[0], len(knns))
+            (inputs.shape[0], len(knns), self.top_k)
         )
         for i, nn in enumerate(knns):
             distances, indices_local = nn.kneighbors(vectors_normed, return_distance=True)
             indices = indices_local + i * self.max_temporary_buffer_size
-            indices = indices.ravel()
-            distances = distances.ravel()
-            vectors_found[:, i, :] = [self.vectors[j] for j in indices]
-            distances_found[:, i] = distances
-        row_indices = np.arange((inputs.shape[0]), dtype=np.int32)
-        nearest_token_indices = distances_found.argmin(axis=-1)
-        vectors_chosen = vectors_found[row_indices, nearest_token_indices, :]
+            for j in range(self.top_k):
+                jth_vectors = [
+                    self.vectors[index]
+                    for index in indices[:, j]
+                ]
+                jth_distances = distances[:, j]
+                vectors_found[:, i, j, :] = jth_vectors
+                distances_found[:, i, j] = jth_distances
+        vectors_found = vectors_found.reshape((inputs.shape[0], len(knns) * self.top_k, inputs.shape[1]))
+        distances_found = distances_found.reshape((inputs.shape[0], len(knns) * self.top_k))
+
+        vectors_chosen = np.zeros((inputs.shape[0], self.top_k, inputs.shape[1]))
+        for i in range(inputs.shape[0]):
+            item_vectors = vectors_found[i]
+            item_distances = distances_found[i]
+            item_distances_min = item_distances.argsort()[:self.top_k]
+            item_vectors_chosen = [item_vectors[j] for j in item_distances_min]
+            for j, vector in enumerate(item_vectors_chosen):
+                vectors_chosen[i, j, :] = vector
+        
         with torch.no_grad():
             vectors_chosen_torch = torch.tensor(vectors_chosen, dtype=inputs.dtype, device=inputs.device)
         return vectors_chosen_torch

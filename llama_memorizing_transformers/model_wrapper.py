@@ -21,6 +21,7 @@ def replace_llama_layer_with_memory(model: LlamaModel,
         module=original_layer,
         context_choice=context.to(model.device),
         memory=memory,
+        device=model.device
     )
     model.layers[layer_index] = new_layer
     model._memorizing_patch = True

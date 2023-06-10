@@ -16,7 +16,8 @@ class MemorizingLlamaDecoderLayer(nn.Module):
     def __init__(self,
                  module: LlamaDecoderLayer,
                  context_choice: BaseContextChoice,
-                 memory: BaseMemoryCollection) -> None:
+                 memory: BaseMemoryCollection,
+                 device: torch.device) -> None:
         """
         Module wraps original LlamaDecoderLayer to add memorizing stuff
         :param module: original decoder layer
@@ -47,6 +48,10 @@ class MemorizingLlamaDecoderLayer(nn.Module):
                 sample_memory_position_ids = position_ids[i]
                 self.memory.add(sample_hidden_states, sample_memory_position_ids)
 
+    def _normed(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        norm = torch.sqrt((hidden_states ** 2).sum(dim=-1, keepdim=True)) + 1e-4
+        return hidden_states / norm, norm
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -57,9 +62,14 @@ class MemorizingLlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         hidden_states_memory = self._extract_from_memory(hidden_states)
-        hidden_states_merged = self.context_choice(hidden_states, hidden_states_memory)
+        hidden_states_normed, hidden_states_norm = self._normed(hidden_states)
+        hidden_states_memory_normed, _ = self._normed(hidden_states_memory)
+        hidden_states_merged = self.context_choice(hidden_states_normed, hidden_states_memory_normed)
+        
+        hidden_states_merged_rescaled = hidden_states_merged * hidden_states_norm
+
         self._add_to_memory(hidden_states, position_ids)
-        return self.module(hidden_states_merged,
+        return self.module(hidden_states_merged_rescaled,
                            attention_mask,
                            position_ids,
                            past_key_value,
